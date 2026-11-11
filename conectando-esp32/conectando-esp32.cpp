@@ -1,30 +1,25 @@
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <time.h>
 
-
 // 1. CONFIGURACAO DO WI-FI
-
 
 const char* WIFI_SSID = "iPhone de Lucas";
 const char* WIFI_PASSWORD = "masteguim1312";
 
-
 // 2. CONFIGURACAO DO EMQX CLOUD
 
-
 const char* MQTT_SERVER =
-    "v11e4d22.ala.us-east-1.emqxsl.com";
+    "r156dad5.ala.eu-central-1.emqxsl.com";
 
 const uint16_t MQTT_PORT = 8883;
 
 const char* MQTT_USER = "Lucas";
 const char* MQTT_PASSWORD = "131205Lm_";
 
-
 // 3. TOPICOS MQTT
-
 
 const char* TOPICO_UMIDADE =
     "lab/sala/umidade_solo";
@@ -32,32 +27,24 @@ const char* TOPICO_UMIDADE =
 const char* TOPICO_LED =
     "esp32/led";
 
-
 // 4. PINOS DO ESP32
 
-
-const int PINO_SENSOR = 4;
+// A0 do sensor resistivo no GPIO 34
+const int PINO_SENSOR = 34;
 const int PINO_LED = 2;
 
-
 // 5. CALIBRACAO DO SENSOR
-
 
 const int VALOR_SECO = 3200;
 const int VALOR_MOLHADO = 1500;
 
-
 // 6. INTERVALOS
-
 
 const unsigned long INTERVALO_PUBLICACAO = 10000;
 const unsigned long INTERVALO_RECONEXAO = 5000;
 const unsigned long TIMEOUT_WIFI = 20000;
 
-
 // 7. CERTIFICADO CA ORIGINAL
-
-
 
 const char* ca_cert =
 "-----BEGIN CERTIFICATE-----\n"
@@ -85,22 +72,57 @@ const char* ca_cert =
 
 // 8. VARIAVEIS DE CONTROLE
 
-unsigned long ultimaPublicacao = 0;
+unsigned long ultimaLeitura = 0;
 unsigned long ultimaTentativaWiFi = 0;
 unsigned long ultimaTentativaMQTT = 0;
 unsigned long inicioConexaoWiFi = 0;
 unsigned long ultimoAvisoWiFi = 0;
-unsigned long ultimaTentativaNTP = 0;
 
 bool tentandoWiFi = false;
-bool horarioSincronizado = false;
+bool horarioConfigurado = false;
+
+int ultimaUmidade = 0;
 
 // 9. CLIENTES
 
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
-// 10. EVENTOS WI-FI
+// 10. LEITURA DO SENSOR RESISTIVO
+
+int lerUmidade() {
+
+  int valorADC = analogRead(PINO_SENSOR);
+
+  long umidade = map(
+      valorADC,
+      VALOR_SECO,
+      VALOR_MOLHADO,
+      0,
+      100
+  );
+
+  umidade = constrain(umidade, 0, 100);
+
+  Serial.println();
+  Serial.println("===== SENSOR RESISTIVO =====");
+
+  Serial.print("GPIO: ");
+  Serial.println(PINO_SENSOR);
+
+  Serial.print("Valor analogico: ");
+  Serial.println(valorADC);
+
+  Serial.print("Umidade do solo: ");
+  Serial.print(umidade);
+  Serial.println("%");
+
+  Serial.println("============================");
+
+  return (int)umidade;
+}
+
+// 11. EVENTOS DO WI-FI
 
 void eventoWiFi(
     WiFiEvent_t event,
@@ -120,7 +142,6 @@ void eventoWiFi(
       Serial.print("IP: ");
       Serial.println(WiFi.localIP());
 
-      tentandoWiFi = false;
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -130,7 +151,6 @@ void eventoWiFi(
           info.wifi_sta_disconnected.reason
       );
 
-      horarioSincronizado = false;
       break;
 
     default:
@@ -138,9 +158,7 @@ void eventoWiFi(
   }
 }
 
-
-// 11. CONEXAO WI-FI
-
+// 12. CONEXAO WI-FI
 
 void conectarWiFi() {
 
@@ -155,16 +173,13 @@ void conectarWiFi() {
   Serial.println(WIFI_SSID);
 
   tentandoWiFi = true;
-
   inicioConexaoWiFi = millis();
   ultimaTentativaWiFi = millis();
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-
-// 12. VERIFICACAO WI-FI
-
+// 13. GERENCIAMENTO DO WI-FI
 
 void verificarWiFi() {
 
@@ -182,7 +197,7 @@ void verificarWiFi() {
 
       ultimoAvisoWiFi = agora;
 
-      Serial.print("Aguardando Wi-Fi... Estado: ");
+      Serial.print("Aguardando Wi-Fi. Estado: ");
       Serial.println(WiFi.status());
     }
 
@@ -206,9 +221,7 @@ void verificarWiFi() {
   }
 }
 
-
-// 13. SINCRONIZACAO NTP
-
+// 14. SINCRONIZACAO NTP
 
 bool sincronizarHorario() {
 
@@ -216,56 +229,30 @@ bool sincronizarHorario() {
     return false;
   }
 
-  time_t horarioAtual = time(nullptr);
+  if (!horarioConfigurado) {
 
-  if (horarioAtual > 1700000000) {
-    horarioSincronizado = true;
+    Serial.println("Iniciando sincronizacao NTP...");
+
+    configTime(
+        0,
+        0,
+        "pool.ntp.org",
+        "time.google.com"
+    );
+
+    horarioConfigurado = true;
+  }
+
+  time_t agora = time(nullptr);
+
+  if (agora > 1700000000) {
     return true;
   }
 
-  horarioSincronizado = false;
-
-  // Evita reiniciar o NTP continuamente
-  if (ultimaTentativaNTP != 0 &&
-      millis() - ultimaTentativaNTP < 10000) {
-    return false;
-  }
-
-  ultimaTentativaNTP = millis();
-
-  Serial.println("Sincronizando horario NTP...");
-
-  configTime(
-      0,
-      0,
-      "pool.ntp.org",
-      "time.google.com"
-  );
-
-  unsigned long inicio = millis();
-
-  while (millis() - inicio < 10000) {
-
-    horarioAtual = time(nullptr);
-
-    if (horarioAtual > 1700000000) {
-
-      Serial.println("Horario sincronizado!");
-
-      horarioSincronizado = true;
-      return true;
-    }
-
-    delay(500);
-  }
-
-  Serial.println("Falha na sincronizacao NTP");
   return false;
 }
 
-
-// 14. CALLBACK MQTT
-
+// 15. RECEBIMENTO MQTT
 
 void callback(
     char* topic,
@@ -281,9 +268,7 @@ void callback(
   mensagem.trim();
   mensagem.toUpperCase();
 
-  Serial.print("Mensagem recebida [");
-  Serial.print(topic);
-  Serial.print("]: ");
+  Serial.print("Mensagem recebida: ");
   Serial.println(mensagem);
 
   if (String(topic) == TOPICO_LED) {
@@ -300,14 +285,12 @@ void callback(
 
     } else {
 
-      Serial.println("Comando LED invalido");
+      Serial.println("Comando invalido");
     }
   }
 }
 
-
-// 15. CONEXAO MQTT
-
+// 16. CONEXAO MQTT
 
 void conectarMQTT() {
 
@@ -317,6 +300,8 @@ void conectarMQTT() {
   }
 
   if (!sincronizarHorario()) {
+
+    Serial.println("Aguardando horario NTP...");
     return;
   }
 
@@ -339,9 +324,6 @@ void conectarMQTT() {
   Serial.print("Porta: ");
   Serial.println(MQTT_PORT);
 
-  Serial.print("Client ID: ");
-  Serial.println(clientId);
-
   if (mqttClient.connect(
           clientId.c_str(),
           MQTT_USER,
@@ -356,15 +338,15 @@ void conectarMQTT() {
 
     } else {
 
-      Serial.println("Falha na inscricao MQTT");
+      Serial.println("Falha ao assinar topico LED");
     }
 
   } else {
 
-    Serial.print("Falha MQTT! rc=");
-    Serial.println(mqttClient.state());
+    int estado = mqttClient.state();
 
-    // CORRECAO PARA ESP32 CORE 3.3.12
+    Serial.print("Falha MQTT! rc=");
+    Serial.println(estado);
 
     char erroTLS[256] = {0};
 
@@ -381,47 +363,18 @@ void conectarMQTT() {
   }
 }
 
+// 17. PUBLICACAO DA UMIDADE
 
-// 16. LEITURA DO SENSOR
-
-
-int lerUmidade() {
-
-  int valorADC = analogRead(PINO_SENSOR);
-
-  long umidade = map(
-      valorADC,
-      VALOR_SECO,
-      VALOR_MOLHADO,
-      0,
-      100
-  );
-
-  umidade = constrain(umidade, 0, 100);
-
-  Serial.print("Leitura analogica: ");
-  Serial.println(valorADC);
-
-  Serial.print("Umidade: ");
-  Serial.print(umidade);
-  Serial.println("%");
-
-  return (int)umidade;
-}
-
-
-// 17. PUBLICACAO MQTT
-
-
-void publicarUmidade() {
+void publicarUmidade(int umidade) {
 
   if (!mqttClient.connected()) {
 
-    Serial.println("MQTT desconectado.");
+    Serial.println(
+        "MQTT desconectado. Leitura apenas local."
+    );
+
     return;
   }
-
-  int umidade = lerUmidade();
 
   String mensagem = String(umidade);
 
@@ -435,24 +388,22 @@ void publicarUmidade() {
     Serial.print("Publicado [");
     Serial.print(TOPICO_UMIDADE);
     Serial.print("]: ");
-    Serial.print(mensagem);
-    Serial.println("%");
+    Serial.println(mensagem);
 
   } else {
 
-    Serial.println("Falha na publicacao");
+    Serial.println("Falha ao publicar MQTT");
   }
 }
 
-
 // 18. SETUP
-
 
 void setup() {
 
-  Serial.begin(115200);
+  // VELOCIDADE SERIAL ALTERADA
+  Serial.begin(9600);
 
-  delay(1000);
+  delay(2000);
 
   Serial.println();
   Serial.println("INICIANDO SISTEMA ESP32");
@@ -469,14 +420,16 @@ void setup() {
       ADC_11db
   );
 
+  // Primeira leitura sem depender da rede
+  ultimaUmidade = lerUmidade();
+
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-
   WiFi.setAutoReconnect(false);
 
   WiFi.onEvent(eventoWiFi);
 
-  // TLS com certificado CA
+  // TLS com certificado original
   espClient.setCACert(ca_cert);
 
   mqttClient.setServer(
@@ -485,31 +438,45 @@ void setup() {
   );
 
   mqttClient.setCallback(callback);
-
   mqttClient.setBufferSize(512);
   mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(10);
+  mqttClient.setSocketTimeout(5);
 
   conectarWiFi();
+
+  ultimaLeitura = millis();
 
   Serial.println("Sistema configurado!");
 }
 
-
 // 19. LOOP PRINCIPAL
-
 
 void loop() {
 
   unsigned long agora = millis();
 
+  // Leitura independente do Wi-Fi e MQTT
+  if (agora - ultimaLeitura >=
+      INTERVALO_PUBLICACAO) {
+
+    ultimaLeitura = agora;
+
+    ultimaUmidade = lerUmidade();
+
+    publicarUmidade(ultimaUmidade);
+  }
+
+  // Verificacao Wi-Fi
   verificarWiFi();
 
   if (WiFi.status() != WL_CONNECTED) {
 
-    delay(100);
+    delay(10);
     return;
   }
+
+  // Verificacao MQTT
+  agora = millis();
 
   if (!mqttClient.connected()) {
 
@@ -524,16 +491,6 @@ void loop() {
   } else {
 
     mqttClient.loop();
-  }
-
-  agora = millis();
-
-  if (agora - ultimaPublicacao >=
-      INTERVALO_PUBLICACAO) {
-
-    ultimaPublicacao = agora;
-
-    publicarUmidade();
   }
 
   delay(10);

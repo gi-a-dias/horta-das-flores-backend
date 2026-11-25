@@ -1,15 +1,16 @@
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
 #include <time.h>
+#include <math.h>
 
-// 1. CONFIGURACAO DO WI-FI
+// 1. CONFIGURACOES WI-FI E MQTT
 
 const char* WIFI_SSID = "iPhone de Lucas";
 const char* WIFI_PASSWORD = "masteguim1312";
-
-// 2. CONFIGURACAO DO EMQX CLOUD
 
 const char* MQTT_SERVER =
     "r156dad5.ala.eu-central-1.emqxsl.com";
@@ -19,32 +20,32 @@ const uint16_t MQTT_PORT = 8883;
 const char* MQTT_USER = "Lucas";
 const char* MQTT_PASSWORD = "131205Lm_";
 
-// 3. TOPICOS MQTT
+const char* TOPICO_UMIDADE = "lab/sala/umidade_solo";
+const char* TOPICO_LED = "esp32/led";
 
-const char* TOPICO_UMIDADE =
-    "lab/sala/umidade_solo";
+// 2. PINOS DO ESP32 DEVKIT V1
 
-const char* TOPICO_LED =
-    "esp32/led";
-
-// 4. PINOS DO ESP32
-
-// A0 do sensor resistivo no GPIO 34
 const int PINO_SENSOR = 34;
 const int PINO_LED = 2;
 
-// 5. CALIBRACAO DO SENSOR
+// 3. CONFIGURACOES DO SENSOR
 
-const int VALOR_SECO = 3200;
-const int VALOR_MOLHADO = 1500;
+const int NUM_LEITURAS = 20;
+const int DESCARTAR_EXTREMOS = 4;
+const int AMOSTRAS_CALIBRACAO = 12;
 
-// 6. INTERVALOS
+const float ALPHA = 0.20f;
 
-const unsigned long INTERVALO_PUBLICACAO = 10000;
+const int SEPARACAO_MINIMA = 20;
+const float FATOR_RUIDO = 4.0f;
+
+// 4. INTERVALOS
+
+const unsigned long INTERVALO_LEITURA = 5000;
 const unsigned long INTERVALO_RECONEXAO = 5000;
 const unsigned long TIMEOUT_WIFI = 20000;
 
-// 7. CERTIFICADO CA ORIGINAL
+// 5. CERTIFICADO CA
 
 const char* ca_cert =
 "-----BEGIN CERTIFICATE-----\n"
@@ -70,59 +71,345 @@ const char* ca_cert =
 "MrY=\n"
 "-----END CERTIFICATE-----\n";
 
-// 8. VARIAVEIS DE CONTROLE
+// 6. OBJETOS
+
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
+Preferences preferencias;
+
+// 7. VARIAVEIS DE CALIBRACAO
+
+int valorSeco = 0;
+int valorMolhado = 0;
+
+int ruidoSeco = 0;
+int ruidoMolhado = 0;
+
+bool secoCalibrado = false;
+bool molhadoCalibrado = false;
+
+float adcFiltrado = 0.0f;
+bool filtroIniciado = false;
+
+// 8. CONTROLE DE CONEXAO
+
+bool tentandoWiFi = false;
+bool ntpIniciado = false;
 
 unsigned long ultimaLeitura = 0;
 unsigned long ultimaTentativaWiFi = 0;
 unsigned long ultimaTentativaMQTT = 0;
-unsigned long inicioConexaoWiFi = 0;
+unsigned long inicioWiFi = 0;
 unsigned long ultimoAvisoWiFi = 0;
 
-bool tentandoWiFi = false;
-bool horarioConfigurado = false;
+// 9. LEITURA DO ADC
 
-int ultimaUmidade = 0;
+int lerADC() {
 
-// 9. CLIENTES
+  int valores[NUM_LEITURAS];
 
-WiFiClientSecure espClient;
-PubSubClient mqttClient(espClient);
+  analogRead(PINO_SENSOR);
+  delay(5);
 
-// 10. LEITURA DO SENSOR RESISTIVO
+  for (int i = 0; i < NUM_LEITURAS; i++) {
+
+    valores[i] = analogRead(PINO_SENSOR);
+    delay(3);
+  }
+
+  // Ordenar os valores
+  for (int i = 0; i < NUM_LEITURAS - 1; i++) {
+
+    for (int j = i + 1; j < NUM_LEITURAS; j++) {
+
+      if (valores[j] < valores[i]) {
+
+        int temporario = valores[i];
+
+        valores[i] = valores[j];
+        valores[j] = temporario;
+      }
+    }
+  }
+
+  // Media descartando extremos
+  long soma = 0;
+
+  for (int i = DESCARTAR_EXTREMOS;
+       i < NUM_LEITURAS - DESCARTAR_EXTREMOS;
+       i++) {
+
+    soma += valores[i];
+  }
+
+  return (int)(
+      soma / (NUM_LEITURAS - 2 * DESCARTAR_EXTREMOS)
+  );
+}
+
+// 10. CALIBRACAO ESTATISTICA
+
+void medirReferencia(int &media, int &ruido) {
+
+  int valores[AMOSTRAS_CALIBRACAO];
+
+  Serial.println();
+  Serial.println("Coletando amostras...");
+
+  for (int i = 0; i < AMOSTRAS_CALIBRACAO; i++) {
+
+    valores[i] = lerADC();
+
+    delay(150);
+  }
+
+  long soma = 0;
+
+  int minimo = 4095;
+  int maximo = 0;
+
+  for (int i = 0; i < AMOSTRAS_CALIBRACAO; i++) {
+
+    int leitura = valores[i];
+
+    soma += leitura;
+
+    if (leitura < minimo) {
+      minimo = leitura;
+    }
+
+    if (leitura > maximo) {
+      maximo = leitura;
+    }
+  }
+
+  media = (int)(soma / AMOSTRAS_CALIBRACAO);
+
+  // Ruido = amplitude entre maximo e minimo
+  ruido = maximo - minimo;
+}
+
+// 11. VALIDACAO DA CALIBRACAO
+
+bool calibracaoValida() {
+
+  if (!secoCalibrado || !molhadoCalibrado) {
+    return false;
+  }
+
+  int diferenca =
+      abs(valorMolhado - valorSeco);
+
+  int maiorRuido =
+      max(ruidoSeco, ruidoMolhado);
+
+  float limite = max(
+      (float)SEPARACAO_MINIMA,
+      FATOR_RUIDO * maiorRuido
+  );
+
+  return diferenca >= limite;
+}
+
+// 12. CARREGAR CALIBRACAO
+
+void carregarCalibracao() {
+
+  preferencias.begin("umidade", false);
+
+  valorSeco = preferencias.getInt("seco", 0);
+  valorMolhado = preferencias.getInt("molhado", 0);
+
+  ruidoSeco = preferencias.getInt("rSeco", 0);
+  ruidoMolhado = preferencias.getInt("rMolhado", 0);
+
+  secoCalibrado =
+      preferencias.getBool("temSeco", false);
+
+  molhadoCalibrado =
+      preferencias.getBool("temMolhado", false);
+
+  Serial.println();
+  Serial.println("===== CALIBRACAO SALVA =====");
+
+  Serial.print("ADC seco: ");
+  Serial.println(valorSeco);
+
+  Serial.print("ADC molhado: ");
+  Serial.println(valorMolhado);
+
+  Serial.print("Oscilacao seco: ");
+  Serial.println(ruidoSeco);
+
+  Serial.print("Oscilacao molhado: ");
+  Serial.println(ruidoMolhado);
+
+  if (calibracaoValida()) {
+
+    Serial.println("Calibracao valida!");
+
+  } else {
+
+    Serial.println("Calibracao pendente ou instavel.");
+    Serial.println("Use S e M para recalibrar.");
+  }
+
+  Serial.println("============================");
+}
+
+// 13. COMANDOS DO MONITOR SERIAL
+
+void verificarComandosSerial() {
+
+  while (Serial.available() > 0) {
+
+    char comando = Serial.read();
+
+    if (comando == 'S' || comando == 's') {
+
+      Serial.println();
+      Serial.println("CALIBRANDO SENSOR SECO...");
+
+      int media = 0;
+      int ruido = 0;
+
+      medirReferencia(media, ruido);
+
+      valorSeco = media;
+      ruidoSeco = ruido;
+
+      secoCalibrado = true;
+
+      preferencias.putInt("seco", valorSeco);
+      preferencias.putInt("rSeco", ruidoSeco);
+      preferencias.putBool("temSeco", true);
+
+      filtroIniciado = false;
+
+      Serial.println("CALIBRACAO SECA REGISTRADA!");
+
+      Serial.print("ADC seco: ");
+      Serial.println(valorSeco);
+
+      Serial.print("Oscilacao: ");
+      Serial.println(ruidoSeco);
+    }
+
+    if (comando == 'M' || comando == 'm') {
+
+      Serial.println();
+      Serial.println("CALIBRANDO SENSOR MOLHADO...");
+
+      int media = 0;
+      int ruido = 0;
+
+      medirReferencia(media, ruido);
+
+      valorMolhado = media;
+      ruidoMolhado = ruido;
+
+      molhadoCalibrado = true;
+
+      preferencias.putInt("molhado", valorMolhado);
+      preferencias.putInt("rMolhado", ruidoMolhado);
+      preferencias.putBool("temMolhado", true);
+
+      filtroIniciado = false;
+
+      Serial.println("CALIBRACAO MOLHADA REGISTRADA!");
+
+      Serial.print("ADC molhado: ");
+      Serial.println(valorMolhado);
+
+      Serial.print("Oscilacao: ");
+      Serial.println(ruidoMolhado);
+    }
+
+    if (comando == 'S' || comando == 's' ||
+        comando == 'M' || comando == 'm') {
+
+      int diferenca =
+          abs(valorMolhado - valorSeco);
+
+      Serial.print("Diferenca ADC: ");
+      Serial.println(diferenca);
+
+      if (calibracaoValida()) {
+
+        Serial.println("CALIBRACAO ACEITA!");
+
+      } else {
+
+        Serial.println(
+            "Calibracao insuficiente ou instavel."
+        );
+      }
+    }
+  }
+}
+// 14. CALCULO DA UMIDADE
 
 int lerUmidade() {
 
-  int valorADC = analogRead(PINO_SENSOR);
+  int adcMedio = lerADC();
 
-  long umidade = map(
-      valorADC,
-      VALOR_SECO,
-      VALOR_MOLHADO,
-      0,
-      100
-  );
+  // Filtro exponencial
+  if (!filtroIniciado) {
 
-  umidade = constrain(umidade, 0, 100);
+    adcFiltrado = adcMedio;
+    filtroIniciado = true;
+
+  } else {
+
+    adcFiltrado =
+        ALPHA * adcMedio +
+        (1.0f - ALPHA) * adcFiltrado;
+  }
 
   Serial.println();
   Serial.println("===== SENSOR RESISTIVO =====");
 
-  Serial.print("GPIO: ");
-  Serial.println(PINO_SENSOR);
+  Serial.print("ADC medio: ");
+  Serial.println(adcMedio);
 
-  Serial.print("Valor analogico: ");
-  Serial.println(valorADC);
+  Serial.print("ADC filtrado: ");
+  Serial.println(adcFiltrado, 1);
 
-  Serial.print("Umidade do solo: ");
-  Serial.print(umidade);
+  if (!calibracaoValida()) {
+
+    Serial.println("UMIDADE DO SOLO: indisponivel");
+    Serial.println("Calibracao insuficiente. Use S e M.");
+    Serial.println("Sem porcentagem publicada.");
+    Serial.println("============================");
+
+    return -1;
+  }
+
+  float umidade =
+      (adcFiltrado - valorSeco) *
+      100.0f /
+      (valorMolhado - valorSeco);
+
+  umidade = constrain(
+      umidade,
+      0.0f,
+      100.0f
+  );
+
+  int porcentagem = (int)roundf(umidade);
+
+  Serial.println("----------------------------");
+  Serial.print("UMIDADE DO SOLO: ");
+  Serial.print(porcentagem);
   Serial.println("%");
+  Serial.println("----------------------------");
 
   Serial.println("============================");
 
-  return (int)umidade;
+  return porcentagem;
 }
 
-// 11. EVENTOS DO WI-FI
+// 15. EVENTOS WI-FI
 
 void eventoWiFi(
     WiFiEvent_t event,
@@ -141,16 +428,15 @@ void eventoWiFi(
 
       Serial.print("IP: ");
       Serial.println(WiFi.localIP());
-
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
 
       Serial.print("Wi-Fi desconectado. Motivo: ");
+
       Serial.println(
           info.wifi_sta_disconnected.reason
       );
-
       break;
 
     default:
@@ -158,8 +444,7 @@ void eventoWiFi(
   }
 }
 
-// 12. CONEXAO WI-FI
-
+// 16. CONEXAO WI-FI
 void conectarWiFi() {
 
   if (WiFi.status() == WL_CONNECTED ||
@@ -168,18 +453,18 @@ void conectarWiFi() {
   }
 
   Serial.println();
-
   Serial.print("Conectando ao Wi-Fi: ");
   Serial.println(WIFI_SSID);
 
   tentandoWiFi = true;
-  inicioConexaoWiFi = millis();
+
+  inicioWiFi = millis();
   ultimaTentativaWiFi = millis();
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-// 13. GERENCIAMENTO DO WI-FI
+// 17. VERIFICACAO DO WI-FI
 
 void verificarWiFi() {
 
@@ -201,7 +486,7 @@ void verificarWiFi() {
       Serial.println(WiFi.status());
     }
 
-    if (agora - inicioConexaoWiFi >= TIMEOUT_WIFI) {
+    if (agora - inicioWiFi >= TIMEOUT_WIFI) {
 
       Serial.println("TIMEOUT WI-FI!");
 
@@ -221,7 +506,7 @@ void verificarWiFi() {
   }
 }
 
-// 14. SINCRONIZACAO NTP
+// 18. SINCRONIZACAO NTP
 
 bool sincronizarHorario() {
 
@@ -229,9 +514,9 @@ bool sincronizarHorario() {
     return false;
   }
 
-  if (!horarioConfigurado) {
+  if (!ntpIniciado) {
 
-    Serial.println("Iniciando sincronizacao NTP...");
+    Serial.println("Sincronizando horario NTP...");
 
     configTime(
         0,
@@ -240,20 +525,13 @@ bool sincronizarHorario() {
         "time.google.com"
     );
 
-    horarioConfigurado = true;
+    ntpIniciado = true;
   }
 
-  time_t agora = time(nullptr);
-
-  if (agora > 1700000000) {
-    return true;
-  }
-
-  return false;
+  return time(nullptr) > 1700000000;
 }
 
-// 15. RECEBIMENTO MQTT
-
+// 19. RECEBIMENTO MQTT / LED
 void callback(
     char* topic,
     byte* payload,
@@ -262,6 +540,7 @@ void callback(
   String mensagem = "";
 
   for (unsigned int i = 0; i < length; i++) {
+
     mensagem += (char)payload[i];
   }
 
@@ -282,16 +561,11 @@ void callback(
 
       digitalWrite(PINO_LED, LOW);
       Serial.println("LED DESLIGADO");
-
-    } else {
-
-      Serial.println("Comando invalido");
     }
   }
 }
 
-// 16. CONEXAO MQTT
-
+// 20. CONEXAO MQTT
 void conectarMQTT() {
 
   if (WiFi.status() != WL_CONNECTED ||
@@ -318,12 +592,6 @@ void conectarMQTT() {
   Serial.println();
   Serial.println("Tentando conexao MQTT com TLS...");
 
-  Serial.print("Broker: ");
-  Serial.println(MQTT_SERVER);
-
-  Serial.print("Porta: ");
-  Serial.println(MQTT_PORT);
-
   if (mqttClient.connect(
           clientId.c_str(),
           MQTT_USER,
@@ -343,10 +611,8 @@ void conectarMQTT() {
 
   } else {
 
-    int estado = mqttClient.state();
-
     Serial.print("Falha MQTT! rc=");
-    Serial.println(estado);
+    Serial.println(mqttClient.state());
 
     char erroTLS[256] = {0};
 
@@ -363,16 +629,19 @@ void conectarMQTT() {
   }
 }
 
-// 17. PUBLICACAO DA UMIDADE
+// 21. PUBLICACAO MQTT
 
 void publicarUmidade(int umidade) {
 
+  if (umidade < 0) {
+
+    Serial.println("Aguardando calibracao.");
+    return;
+  }
+
   if (!mqttClient.connected()) {
 
-    Serial.println(
-        "MQTT desconectado. Leitura apenas local."
-    );
-
+    Serial.println("MQTT desconectado. Leitura local.");
     return;
   }
 
@@ -396,13 +665,11 @@ void publicarUmidade(int umidade) {
   }
 }
 
-// 18. SETUP
+// 22. SETUP
 
 void setup() {
 
-  // VELOCIDADE SERIAL ALTERADA
   Serial.begin(9600);
-
   delay(2000);
 
   Serial.println();
@@ -420,8 +687,7 @@ void setup() {
       ADC_11db
   );
 
-  // Primeira leitura sem depender da rede
-  ultimaUmidade = lerUmidade();
+  carregarCalibracao();
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -429,7 +695,6 @@ void setup() {
 
   WiFi.onEvent(eventoWiFi);
 
-  // TLS com certificado original
   espClient.setCACert(ca_cert);
 
   mqttClient.setServer(
@@ -446,27 +711,29 @@ void setup() {
 
   ultimaLeitura = millis();
 
+  Serial.println();
   Serial.println("Sistema configurado!");
+  Serial.println("Comandos: S=seco, M=molhado");
 }
 
-// 19. LOOP PRINCIPAL
+// 23. LOOP PRINCIPAL
 
 void loop() {
 
+  verificarComandosSerial();
+
   unsigned long agora = millis();
 
-  // Leitura independente do Wi-Fi e MQTT
   if (agora - ultimaLeitura >=
-      INTERVALO_PUBLICACAO) {
+      INTERVALO_LEITURA) {
 
     ultimaLeitura = agora;
 
-    ultimaUmidade = lerUmidade();
+    int umidade = lerUmidade();
 
-    publicarUmidade(ultimaUmidade);
+    publicarUmidade(umidade);
   }
 
-  // Verificacao Wi-Fi
   verificarWiFi();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -475,7 +742,6 @@ void loop() {
     return;
   }
 
-  // Verificacao MQTT
   agora = millis();
 
   if (!mqttClient.connected()) {
